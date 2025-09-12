@@ -65,8 +65,8 @@ class UKF:
 
         self.Wm = Wm
         self.Wc = Wc
-
         return None
+
     def _sigma_points(self, mean_x, P):
         # Dimention tanget space
         n = self.n
@@ -74,6 +74,7 @@ class UKF:
         lambda_ = self.alpha**2 * (n + self.kappa) - n
         U = cholesky((lambda_ + n)*P, lower=False)
         U_aux = scipy.linalg.sqrtm((lambda_ + n)*P)
+
         sigmas = np.zeros((2*n+1, n))
         sigmas[0, :] = mean_x
 
@@ -82,5 +83,48 @@ class UKF:
             sigmas[k+1, :]   = mean_x + U[:, k]
             sigmas[n+k+1, :] = mean_x - U[:, k]
         return sigmas
-        
-        
+
+    def _exp(self, w):        
+        wx = w[0]
+        wy = w[1]
+        wz = w[2]
+        alpha_w = np.sqrt(wx**2 + wy**2 + wz**2) + 1.0e-12
+        s = np.cos(alpha_w/2.0)
+        v_1 = np.sin(alpha_w/2.0) * (wx / alpha_w)
+        v_2 = np.sin(alpha_w/2.0) * (wy / alpha_w)
+        v_3 = np.sin(alpha_w/2.0) * (wz / alpha_w)
+        return np.array([s, v_1, v_2, v_3])
+
+    def quatdot_multiply(self, q1, q2):
+        q1 = np.asarray(q1).reshape(4)
+        w, x, y, z = q1
+        ww, wx, wy, wz = np.asarray(q2).reshape(4)
+
+        H_r_plus = np.array([
+            [ w, -x, -y, -z],
+            [ x,  w, -z,  y],
+            [ y,  z,  w, -x],
+            [ z, -y,  x,  w],
+        ])
+
+        omega_quat = np.array([ww, wx, wy, wz])
+        product = (H_r_plus @ omega_quat)
+        return product
+
+    def _sigma_points_manifold(self, estimated, sigma_points):
+        q_estimated = estimated[0:4]
+        w_estimate = estimated[4:7]
+        print(w_estimate.shape)
+
+        # Empy vector sigma points
+        sigma_points_manifold = np.zeros((sigma_points.shape[0], 7))
+        for k in range(sigma_points.shape[0]):
+            # Projection of the sigma points to the quaternio
+            print(sigma_points[k, 0:3])
+            quaternion_pojection = self.quatdot_multiply(q_estimated, self._exp(sigma_points[k, 0:3]))
+            omega_projection = w_estimate + sigma_points[k, 3:6]
+
+            # Update sigma points manifold
+            sigma_points_manifold[k, 0:4] = quaternion_pojection
+            sigma_points_manifold[k, 4:7] = omega_projection
+        return sigma_points_manifold

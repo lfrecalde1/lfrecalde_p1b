@@ -556,13 +556,17 @@ def filters_ukf(imu_data, imu_params, imu_ts, vicon_data, vicon_ts,
     Q = np.eye(6)* 0.001;
     R = np.eye(3) * 0.1;
 
+    # Init Estimate
+    x_hat = np.zeros((7,))
+    x_hat[0] = 1.0
 
-    #P = Eigen::MatrixXd::Zero(x_dim, x_dim);
     W = UKF(n = 6, alpha=0.1, beta=2.0, kappa=0.0)
     Wm, Wc = W.weights
     sigmas = W._sigma_points(mean_tangent, P0)
-    print(sigmas)
+    sigmas_manifold =  W._sigma_points_manifold(estimated=x_hat, sigma_points=sigmas)
 
+    print(sigmas[0, :])
+    print(sigmas_manifold[0, :])
     return None
 
 def main():
