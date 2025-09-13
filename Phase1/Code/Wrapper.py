@@ -516,58 +516,218 @@ def deg2rad(d): return d * np.pi / 180.0
 
 def filters_ukf(imu_data, imu_params, imu_ts, vicon_data, vicon_ts,
                        flag):
-    ## ---------------------------- P1 B -----------------------------------
+    # ---------- Preprocess & sync ----------
     acc_data_normalized, gyro_data_filtered = scale_measurements_normalized(imu_data, imu_params)
-
     t_sync = _choose_target_time(imu_ts[0, :].ravel(), vicon_ts[0, :].ravel(), prefer="denser")
+    acc_sync  = interp_linear_timeseries(imu_ts[0, :], acc_data_normalized,  t_sync)
+    gyro_sync = interp_linear_timeseries(imu_ts[0, :], gyro_data_filtered,  t_sync)
 
-    # IMU (acc & gyro) are linear-interpolated per axis
-    acc_sync  = interp_linear_timeseries(imu_ts[0, :],  acc_data_normalized,  t_sync)   
-    gyro_sync = interp_linear_timeseries(imu_ts[0, :],  gyro_data_filtered, t_sync)   
-
-    # Interpolation of the rotation matrices 
+    # For evaluation only
     R_sync = slerp_rotmats(vicon_ts[0, :], vicon_data, t_sync)
+    quat_vicon_sync = quat_from_matrix(R_sync)
 
-    # Compute euler angles from vicon
-    quaternion_vicon_sync = quat_from_matrix(R_sync)
+    # ---------- State & covariances ----------
+    # State x = [q (4), b (3)] ; tangent xi = [dtheta (3), db (3)] -> n = 6
+    n_tan = 6
 
-    # Plot Results to verify behavior of the signals
-    # PLot acceleration
-    plot_acc(t_sync, acc_sync)
-
-    # Plot gyro
-    plot_gyro(t_sync, gyro_sync)
-
-    # Init variable
-    mean_tangent = np.zeros((6,))
-    sigma_rp = deg2rad(7.0)
-    sigma_yaw = deg2rad(10)
-    sigma_omega0 = deg2rad(4)
-
-    P_theta0 = np.diag([sigma_rp**2, sigma_rp**2, sigma_yaw**2])
-    P_omega0 = (sigma_omega0**2) * np.eye(3)
-
-    # Init Covariance Matrix
-    P0 = np.block([
-        [P_theta0,             np.zeros((3, 3))],
-        [np.zeros((3, 3)),     P_omega0]
-    ])
-    # Model Matrix
-    Q = np.eye(6)* 0.001;
-    R = np.eye(3) * 0.1;
-
-    # Init Estimate
+    # Initial mean
     x_hat = np.zeros((7,))
-    x_hat[0] = 1.0
+    x_hat[0] = 1.0            # unit quaternion
 
-    W = UKF(n = 6, alpha=0.1, beta=2.0, kappa=0.0)
+    # initial gyro bias can be 0 or from a short stationary calibration
+    b_sigma0 = deg2rad(0.1)/np.sqrt(3.0)  # example small bias prior
+
+    # Initial covariance (tangent)
+    sigma_rp  = deg2rad(7.0)
+    sigma_yaw = deg2rad(10.0)
+
+    P_theta0  = np.diag([sigma_rp**2, sigma_rp**2, sigma_yaw**2])
+    P_b0      = (b_sigma0**2)*np.eye(3)
+    P = np.block([[P_theta0,            np.zeros((3,3))],
+                  [np.zeros((3,3)),     P_b0]])
+
+    # Process noise (tangent): [attitude random walk proxy, bias RW]
+    # The attitude part models unmodeled gyro noise after being used as input.
+    q_proc   = (deg2rad(0.2))**2         # tune wrt gyro noise*dt
+    b_rw     = (deg2rad(0.02))**2        # bias random walk per step
+    Q = np.diag([q_proc, q_proc, q_proc, b_rw, b_rw, b_rw])
+
+    # Accelerometer direction noise (unit vector)
+    Ra = (0.01**2)*np.eye(3)
+
+    # ---------- UKF weights ----------
+    W = UKF(n=n_tan, alpha=0.1, beta=2.0, kappa=0.0)
     Wm, Wc = W.weights
-    sigmas = W._sigma_points(mean_tangent, P0)
-    sigmas_manifold =  W._sigma_points_manifold(estimated=x_hat, sigma_points=sigmas)
 
-    print(sigmas[0, :])
-    print(sigmas_manifold[0, :])
-    return None
+    # ---------- Helpers ----------
+    def q_normalize(q):
+        q = np.asarray(q).reshape(4)
+        return q / (np.linalg.norm(q) + 1e-15)
+
+    def q_mul(q1, q2):  # scalar-first
+        w, x, y, z = q1
+        ww, wx, wy, wz = q2
+        return np.array([
+            w*ww - x*wx - y*wy - z*wz,
+            w*wx + x*ww + y*wz - z*wy,
+            w*wy - x*wz + y*ww + z*wx,
+            w*wz + x*wy - y*wx + z*ww
+        ])
+
+    def q_exp(d):
+        th = np.linalg.norm(d)
+        if th < 1e-12:
+            return np.array([1.0, 0.5*d[0], 0.5*d[1], 0.5*d[2]])
+        s = np.sin(0.5*th)/th
+        return np.array([np.cos(0.5*th), s*d[0], s*d[1], s*d[2]])
+
+    def q_log(q):
+        q = q_normalize(q)
+        s, v = q[0], q[1:]
+        nv = np.linalg.norm(v)
+        if nv < 1e-12:
+            return np.zeros(3)
+        ang = np.arctan2(nv, s)
+        return (2.0*ang/nv) * v
+
+    def boxplus(q, d):
+        return q_normalize(q_mul(q, q_exp(d)))
+
+    def boxminus(q1, q2):
+        q2inv = np.array([q2[0], -q2[1], -q2[2], -q2[3]])
+        return q_log(q_mul(q2inv, q1))
+
+    def R_of_q(q):
+        q = q_normalize(q)
+        w, x, y, z = q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ])
+
+    def quat_weighted_mean(Qs, Wm, eps=1e-9, iters=20):
+        q_bar = q_normalize(Qs[int(np.argmax(Wm))])
+        for _ in range(iters):
+            Qs_align = np.array([q if np.dot(q, q_bar) >= 0.0 else -q for q in Qs])
+            E = np.array([boxminus(qi, q_bar) for qi in Qs_align])  # (2n+1,3)
+            Delta = (Wm[:, None] * E).sum(axis=0)
+            if np.linalg.norm(Delta) < eps:
+                break
+            q_bar = boxplus(q_bar, Delta)
+        return q_bar
+
+    # ---------- Logs (optional) ----------
+    q_hist = np.zeros((4, t_sync.shape[0]))
+    b_hist = np.zeros((3, t_sync.shape[0]))
+    P_hist = np.zeros((6, 6, t_sync.shape[0]))
+
+    q_hist[:, 0] = x_hat[0:4]
+    b_hist[:, 0] = x_hat[4:7]
+    P_hist[:, :, 0] = P
+
+    g = np.array([0.0, 0.0, 9.80665])
+
+    # ---------- Main loop ----------
+    for k in range(t_sync.shape[0]-1):
+        dt = float(t_sync[k+1] - t_sync[k])
+
+        q_bar = x_hat[0:4].copy()
+        b_bar = x_hat[4:7].copy()
+        omega_m = gyro_sync[:, k]  # <-- GYRO MEASUREMENT USED IN PROPAGATION
+
+        # --- Sigma generation in tangent (no Q here) ---
+        Xi = W._sigma_points(P)  # (2n+1, 6), centered at 0
+
+        # --- Retract to state space ---
+        # Xsig_state[i] = [q_i, b_i]
+        Xsig_state = np.zeros((Xi.shape[0], 7))
+        for i in range(Xi.shape[0]):
+            dth = Xi[i, 0:3]
+            db  = Xi[i, 3:6]
+            qi = boxplus(q_bar, dth)
+            bi = b_bar + db
+            Xsig_state[i, 0:4] = qi
+            Xsig_state[i, 4:7] = bi
+
+        # --- PROPAGATION USING GYRO MEASUREMENT (Design A) ---
+        Xsig_prop = np.zeros_like(Xsig_state)
+
+        for i in range(Xsig_state.shape[0]):
+            qi = Xsig_state[i, 0:4]
+            bi = Xsig_state[i, 4:7]
+
+            # integrate with (omega_m - bias_i)
+            # your W.integral signature: integral(q, omega, K, ts)
+            qi_next = np.array(W.integral(qi, omega_m - bi, 0.0, dt)).reshape(4)
+            qi_next = q_normalize(qi_next)
+
+            # bias random walk (mean stays same; noise is accounted by Q)
+            bi_next = bi
+
+            Xsig_prop[i, 0:4] = qi_next
+            Xsig_prop[i, 4:7] = bi_next
+
+        # --- Predicted mean ---
+        Qs = Xsig_prop[:, 0:4]
+        Bs = Xsig_prop[:, 4:7]
+        q_pred = quat_weighted_mean(Qs, Wm)
+        b_pred = (Wm[:, None] * Bs).sum(axis=0)
+
+        E_q = np.array([boxminus(Qs[i], q_pred) for i in range(Qs.shape[0])])  # (2n+1,3)
+        E_b = Bs - b_pred                                                     # (2n+1,3)
+        Xi_res = np.hstack([E_q, E_b])                                       # (2n+1,6)
+        P_pred = np.zeros_like(P)
+        for i in range(Xi_res.shape[0]):
+            P_pred += Wc[i] * np.outer(Xi_res[i], Xi_res[i])
+        P_pred += Q
+        
+                # --- Accelerometer update (gravity direction) ---
+        z_a = acc_sync[:, k]
+        z_a = z_a / (np.linalg.norm(z_a) + 1e-15)
+
+        # predict accel direction from each propagated sigma
+        Z = []
+        for i in range(Xsig_prop.shape[0]):
+            Ri = R_of_q(Xsig_prop[i, 0:4])
+            zi = Ri.T @ (g / np.linalg.norm(g))
+            zi = zi / (np.linalg.norm(zi) + 1e-15)
+            Z.append(zi)
+        Z = np.asarray(Z)                      # (2n+1,3)
+        z_hat = (Wm[:, None] * Z).sum(axis=0)
+        dZ = Z - z_hat
+
+        # residuals around (q_pred, b_pred)
+        E_q2 = np.array([boxminus(Xsig_prop[i, 0:4], q_pred) for i in range(Xsig_prop.shape[0])])
+        E_b2 = Xsig_prop[:, 4:7] - b_pred
+        Xi_res2 = np.hstack([E_q2, E_b2])     # (2n+1,6)
+
+        S = Ra.copy()
+        Pxz = np.zeros((6, 3))
+        for i in range(Z.shape[0]):
+            S   += Wc[i] * np.outer(dZ[i], dZ[i])
+            Pxz += Wc[i] * np.outer(Xi_res2[i], dZ[i])
+
+        K = Pxz @ np.linalg.inv(S)
+        nu = z_a - z_hat
+        dx = K @ nu
+
+        dth = dx[0:3]; db = dx[3:6]
+        q_post = boxplus(q_pred, dth)
+        b_post = b_pred + db
+        P_post = P_pred - K @ S @ K.T
+
+        # commit
+        x_hat[0:4] = q_post
+        x_hat[4:7] = b_post
+        P = P_post
+
+        # logs
+        q_hist[:, k+1] = x_hat[0:4]
+        b_hist[:, k+1] = x_hat[4:7]
+        P_hist[:, :, k+1] = P
+    rpy_ukf = quat_to_euler_xyz(q_hist)
+    return rpy_ukf
 
 def main():
 
@@ -624,16 +784,17 @@ def main():
         vicon_data = None
         vicon_ts   = None
         flag = False
-    filters_ukf(imu_data, imu_params, imu_ts, vicon_data, vicon_ts, flag) 
+    rpy_ukf = filters_ukf(imu_data, imu_params, imu_ts, vicon_data, vicon_ts, flag) 
+
     #if flag:
     ## returns: acc, gyro, complementary, madgwick, vicon, t
-    #    rpy_acc_sync, rpy_gyro_quat, rpy_complementary, rpy_madgwick, rpy_vicon_sync, t_sync = filters_estimation(imu_data, imu_params, imu_ts, vicon_data, vicon_ts, flag)
-    #    plot_all_methods_new(t_sync, rpy_acc_sync,                  # acc
-    #        time_rot=t_sync, rpy_rot=rpy_vicon_sync,           # vicon (present)
-    #        time_gyro=t_sync, rpy_gyro=rpy_gyro_quat,          # gyro
-    #        time_complement=t_sync, rpy_complement=rpy_complementary,  # complementary
-    #        time_madgwick=t_sync, rpy_madgwick=rpy_madgwick,   # madgwick
-    #        name=f"Results{args.exp_num}")
+    rpy_acc_sync, rpy_gyro_quat, rpy_complementary, rpy_madgwick, rpy_vicon_sync, t_sync = filters_estimation(imu_data, imu_params, imu_ts, vicon_data, vicon_ts, flag)
+    plot_all_methods_new(t_sync, rpy_acc_sync,                  # acc
+    time_rot=t_sync, rpy_rot=rpy_vicon_sync,           # vicon (present)
+        time_gyro=t_sync, rpy_gyro=rpy_gyro_quat,          # gyro
+        time_complement=t_sync, rpy_complement=rpy_complementary,  # complementary
+        time_madgwick=t_sync, rpy_madgwick=rpy_ukf,   # madgwick
+        name=f"Results{args.exp_num}")
     #else:
     #    # returns: acc, gyro, complementary, madgwick, t
     #    rpy_acc_sync, rpy_gyro_quat, rpy_complementary, rpy_madgwick, t_sync = filters_estimation(imu_data, imu_params, imu_ts, vicon_data, vicon_ts, flag)
