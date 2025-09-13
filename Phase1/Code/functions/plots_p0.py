@@ -148,6 +148,7 @@ def plot_all_methods_new(time_acc, rpy_acc,
                          time_gyro=None, rpy_gyro=None,
                          time_complement=None, rpy_complement=None,
                          time_madgwick=None, rpy_madgwick=None,
+                         time_ukf=None, rpy_ukf=None,
                          name="rpy_axis"):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -161,6 +162,7 @@ def plot_all_methods_new(time_acc, rpy_acc,
             "gyro":          "red",
             "complementary": "green",
             "madgwick":      "orange",
+            "ukf":           "purple",
         }
         linestyles = {
             "vicon":         "solid",
@@ -168,20 +170,23 @@ def plot_all_methods_new(time_acc, rpy_acc,
             "gyro":          "dotted",
             "complementary": "dashdot",
             "madgwick":      (0, (3, 1, 1, 1)),  # dash-dot-dot
+            "ukf":           (0, (5, 2)),        # long dash
         }
 
         # Always include accelerometer
         methods = [(time_acc, rpy_acc, "acc")]
 
-        # Conditionally add the others
-        if time_rot is not None and rpy_rot is not None and len(time_rot) > 0 and rpy_rot.size > 0:
+        # Conditionally add the others (same style of checks)
+        if time_rot is not None and rpy_rot is not None and len(time_rot) > 0 and getattr(rpy_rot, "size", 0) > 0:
             methods.append((time_rot, rpy_rot, "vicon"))
-        if time_gyro is not None and rpy_gyro is not None and len(time_gyro) > 0 and rpy_gyro.size > 0:
+        if time_gyro is not None and rpy_gyro is not None and len(time_gyro) > 0 and getattr(rpy_gyro, "size", 0) > 0:
             methods.append((time_gyro, rpy_gyro, "gyro"))
-        if time_complement is not None and rpy_complement is not None and len(time_complement) > 0 and rpy_complement.size > 0:
+        if time_complement is not None and rpy_complement is not None and len(time_complement) > 0 and getattr(rpy_complement, "size", 0) > 0:
             methods.append((time_complement, rpy_complement, "complementary"))
-        if time_madgwick is not None and rpy_madgwick is not None and len(time_madgwick) > 0 and rpy_madgwick.size > 0:
+        if time_madgwick is not None and rpy_madgwick is not None and len(time_madgwick) > 0 and getattr(rpy_madgwick, "size", 0) > 0:
             methods.append((time_madgwick, rpy_madgwick, "madgwick"))
+        if time_ukf is not None and rpy_ukf is not None and len(time_ukf) > 0 and getattr(rpy_ukf, "size", 0) > 0:
+            methods.append((time_ukf, rpy_ukf, "ukf"))
 
         fig, axes = plt.subplots(1, 3, figsize=(12, 3), sharex=False, sharey=False)
 
@@ -196,8 +201,8 @@ def plot_all_methods_new(time_acc, rpy_acc,
                     label=method,
                     color=method_colors[method],
                     linestyle=linestyles[method],
-                    linewidth=1.6 if method in ("vicon", "complementary", "madgwick") else 1.2,
-                    zorder=3 if method in ("vicon", "complementary", "madgwick") else 2,
+                    linewidth=1.6 if method in ("vicon", "complementary", "madgwick", "ukf") else 1.2,
+                    zorder=3 if method in ("vicon", "complementary", "madgwick", "ukf") else 2,
                 )
             ax.set_title(label.capitalize())
             ax.set_xlabel("Time [s]")

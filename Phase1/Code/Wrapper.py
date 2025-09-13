@@ -367,7 +367,7 @@ def madwick_filter(gyro, q0, t, dynamics, acc, flow, K_quat=10.0, renorm=True):
         J = jacobian_madgwick(q)
         gradient = J.T@f
         q_dot_a = gradient/(np.linalg.norm(gradient))
-        q_dot = q_dot_w - 2*q_dot_a
+        q_dot = q_dot_w - 1.1*q_dot_a
         q_dot = np.array(q_dot).reshape((4,))
     
         # Integration method
@@ -793,7 +793,8 @@ def main():
     time_rot=t_sync, rpy_rot=rpy_vicon_sync,           # vicon (present)
         time_gyro=t_sync, rpy_gyro=rpy_gyro_quat,          # gyro
         time_complement=t_sync, rpy_complement=rpy_complementary,  # complementary
-        time_madgwick=t_sync, rpy_madgwick=rpy_ukf,   # madgwick
+        time_madgwick=t_sync, rpy_madgwick=rpy_madgwick,
+        time_ukf=t_sync, rpy_ukf=rpy_ukf,
         name=f"Results{args.exp_num}")
     #else:
     #    # returns: acc, gyro, complementary, madgwick, t
